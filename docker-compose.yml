@@ -1,0 +1,146 @@
+x-postgres-common:
+  &postgres-common
+  image: postgres:14-alpine
+  user: postgres
+  restart: always
+  healthcheck:
+    test: 'pg_isready -U user --dbname=postgres'
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+networks:
+  pg_rep:
+    driver: bridge
+
+services:
+  traefik:
+    image: traefik:v2.5
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--entrypoints.web.address=:80"
+      - "--accesslog" # Enable access log
+    ports:
+      - 80:80
+      - 8080:8080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - pg_rep
+
+  fast_api:
+    image: fast_api:local
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fast_api.rule=Host(`localhost`)"
+      - "traefik.http.services.fast_api.loadbalancer.server.port=8000"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    scale: 3
+    ports:
+      - 8000
+    depends_on:
+      - pg_pool
+    restart: on-failure
+    networks:
+      - pg_rep
+
+  pg_pool:
+    image: bitnami/pgpool:4
+    ports:
+      - 5437:5432
+    environment:
+      PGPOOL_BACKEND_NODES: "0:postgres_primary:5432,1:postgres_replica:5432,2:postgres_replica_2:5432"
+      PGPOOL_SR_CHECK_USER: user
+      PGPOOL_SR_CHECK_PASSWORD: password
+      PGPOOL_SR_CHECK_PERIOD: 5
+      PGPOOL_ENABLE_LDAP: "no"
+      PGPOOL_ENABLE_POOL_HBA: "yes"
+      PGPOOL_POSTGRES_USERNAME: user
+      PGPOOL_POSTGRES_PASSWORD: password
+      PRIMARY_DB_USER: user
+      PRIMARY_DB_PASSWORD: password
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_password
+      REPLICATION_SLOT_NAME: replication_slot,replication_slot_2
+      PGPOOL_ADMIN_USERNAME: admin
+      PGPOOL_ADMIN_PASSWORD: admin_password
+      PGPOOL_LOAD_BALANCE_MODE: on
+      PGPOOL_LOG_STATEMENT: on
+      PGPOOL_LOG_PER_NODE_STATEMENT: on
+    depends_on:
+      - postgres_primary
+      - postgres_replica
+    networks:
+      - pg_rep
+    
+  
+  postgres_primary:
+    <<: *postgres-common
+    ports:
+      - 5435:5432
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_HOST_AUTH_METHOD: "scram-sha-256\nhost replication all 0.0.0.0/0 md5"
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    command: |
+      postgres 
+      -c wal_level=replica 
+      -c hot_standby=on 
+      -c max_wal_senders=10 
+      -c max_replication_slots=10 
+      -c hot_standby_feedback=on
+    volumes:
+      - ./00_init.sql:/docker-entrypoint-initdb.d/00_init.sql
+    networks:
+      - pg_rep
+
+  postgres_replica:
+    <<: *postgres-common
+    ports:
+      - 5436:5432
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: replicator_password
+    command: |
+      bash -c "
+      until pg_basebackup --pgdata=/var/lib/postgresql/data -R --slot=replication_slot --host=postgres_primary --port=5432
+      do
+      echo 'Waiting for primary to connect...'
+      sleep 1s
+      done
+      echo 'Backup done, starting replica...'
+      chmod 0700 /var/lib/postgresql/data
+      postgres
+      "
+    depends_on:
+      - postgres_primary
+    networks:
+      - pg_rep
+
+  postgres_replica_2:
+    <<: *postgres-common
+    ports:
+      - 5438:5432
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: replicator_password
+    command: |
+      bash -c "
+      until pg_basebackup --pgdata=/var/lib/postgresql/data -R --slot=replication_slot2 --host=postgres_primary --port=5432
+      do
+      echo 'Waiting for primary to connect...'
+      sleep 1s
+      done
+      echo 'Backup done, starting replica...'
+      chmod 0700 /var/lib/postgresql/data
+      postgres
+      "
+    depends_on:
+      - postgres_primary
+    networks:
+      - pg_rep
